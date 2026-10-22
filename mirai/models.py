@@ -201,6 +201,11 @@ class InTransaction(BaseTrackingModel):
         LIVE = "live", "Live"
         TEST = "test", "Test"
 
+    class Type(models.TextChoices):
+        COLLECTION = "collection", "Collection"
+        DISBURSEMENT = "disbursement", "Disbursement"
+        REVERSAL = "reversal", "Reversal"    
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     # Ownership: nullable until the Merchant model exists
@@ -220,6 +225,15 @@ class InTransaction(BaseTrackingModel):
     transaction_ref = models.CharField(max_length=100, unique=True, editable=False)  # yours
     merchant_reference = models.CharField(max_length=100, blank=True)                # theirs
 
+    type = models.CharField(
+        max_length=20, choices=Type.choices, default=Type.COLLECTION, db_index=True,
+    )
+
+    related_transaction = models.ForeignKey(
+        "self", on_delete=models.PROTECT, null=True, blank=True, related_name="reversals",
+    )
+
+
     # Customer
     msisdn = models.CharField(max_length=15)
     network = models.CharField(max_length=20, blank=True, default="")
@@ -229,8 +243,10 @@ class InTransaction(BaseTrackingModel):
     # Money
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     currency = models.CharField(max_length=3, default="TZS")
+    platform_fee = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     fees = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     net_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
 
     # Status
     status = models.CharField(
@@ -244,6 +260,8 @@ class InTransaction(BaseTrackingModel):
     provider_response = models.JSONField(null=True, blank=True)
     transaction_id = models.CharField(max_length=100, blank=True, null=True)       # provider's ID
     external_reference = models.CharField(max_length=255, null=True, blank=True)
+
+    balance_after = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
 
     # Callback to merchant
     webhook = models.URLField(max_length=500, blank=True, default="")
@@ -275,6 +293,27 @@ class InTransaction(BaseTrackingModel):
         if not self.transaction_ref:
             self.transaction_ref = generate_transaction_ref()
         super().save(*args, **kwargs)
+
+
+    @property
+    def direction(self):
+        if self.type in self.CREDIT_TYPES:
+            return "credit"
+        if self.type in self.DEBIT_TYPES:
+            return "debit"
+        return "credit" if self.amount >= 0 else "debit"     # adjustment: sign of amount
+
+    @property
+    def balance_effect(self):
+        """Signed change to the merchant balance."""
+        fee = self.platform_fee or 0
+        if self.type == self.Type.COLLECTION:
+            return self.amount - fee                  # customer pays 10,000, fee 150 → +9,850
+        if self.type == self.Type.DISBURSEMENT:
+            return -(self.amount + fee)               # pay out 10,000, fee 150 → −10,150
+        if self.type == self.Type.REVERSAL:
+            return self.amount                        # full refund, fee included
+        return self.amount      
 
 
 from django.db import models
@@ -478,24 +517,35 @@ class User(AbstractUser):
     )        
 
 
-
 class FeePlan(BaseTrackingModel):
-    """Platform fee for a merchant. merchant=None means the default plan for everyone."""
+    """
+    Platform fee. Most specific match wins.
+    Blank merchant = default for everyone. Blank network = all networks.
+    """
     merchant = models.ForeignKey(
         "Merchant", on_delete=models.CASCADE, null=True, blank=True, related_name="fee_plans",
     )
-    network = models.CharField(max_length=20, blank=True, default="")   # "" = all networks
-    percent = models.DecimalField(max_digits=5, decimal_places=2, default=0)      # e.g. 1.50 = 1.5%
-    fixed = models.DecimalField(max_digits=12, decimal_places=2, default=0)       # flat TZS
+    transaction_type = models.CharField(
+        max_length=20,
+        choices=[("collection", "Collection"), ("disbursement", "Disbursement")],
+        default="collection",
+    )
+    network = models.CharField(max_length=20, blank=True, default="")
+
+    # Band: this plan applies when min_amount <= amount <= max_amount
+    min_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    max_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)  # blank = no upper limit
+
+    percent = models.DecimalField(max_digits=5, decimal_places=2, default=0)   # 1.50 = 1.5%
+    fixed = models.DecimalField(max_digits=12, decimal_places=2, default=0)    # flat TZS
     minimum = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     maximum = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     is_active = models.BooleanField(default=True)
 
     class Meta:
-        constraints = [
-            models.UniqueConstraint(fields=["merchant", "network"], name="unique_fee_plan"),
-        ]
+        ordering = ["transaction_type", "network", "min_amount"]
 
     def __str__(self):
         who = self.merchant or "Default"
-        return f"{who} / {self.network or 'all'}: {self.percent}% + {self.fixed}"    
+        top = self.max_amount if self.max_amount is not None else "∞"
+        return f"{who} {self.transaction_type} {self.network or 'all'} [{self.min_amount}–{top}]"
