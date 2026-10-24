@@ -82,7 +82,6 @@ class InitiateCollection(APIView):
                 raise          # any other constraint: let the real error show
             # Row is committed here. Don't wrap the provider call in atomic().
             result = gateway.collect(txn)
-
             txn.status = result.status
             txn.provider_status = result.provider_status
             txn.transaction_id = result.provider_txn_id

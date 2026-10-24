@@ -204,7 +204,10 @@ class InTransaction(BaseTrackingModel):
     class Type(models.TextChoices):
         COLLECTION = "collection", "Collection"
         DISBURSEMENT = "disbursement", "Disbursement"
-        REVERSAL = "reversal", "Reversal"    
+        REVERSAL = "reversal", "Reversal"   
+
+    CREDIT_TYPES = {"collection", "reversal"}
+    DEBIT_TYPES = {"disbursement"}
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -244,6 +247,7 @@ class InTransaction(BaseTrackingModel):
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     currency = models.CharField(max_length=3, default="TZS")
     platform_fee = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    provider_fee = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     fees = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     net_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)

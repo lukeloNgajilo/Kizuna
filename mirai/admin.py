@@ -8,9 +8,10 @@ from django.db.models import Count
 from django.utils import timezone
 from django.utils.html import format_html
 from django.urls import reverse
-
+from decimal import Decimal, ROUND_HALF_UP
 from .models import APIKey, Merchant, generate_webhook_secret,InTransaction,IdempotencyRecord, FeePlan
-
+from django.core.exceptions import ValidationError
+from django.db.models import Q
 
 # ───────────────────────── Shared helpers ─────────────────────────
 
@@ -297,23 +298,30 @@ IDEM_STATUS_COLORS = {
 
 
 # ───────────────────────── Transactions ─────────────────────────
+TXN_TYPE_COLORS = {
+    InTransaction.Type.COLLECTION: "#15803d",
+    InTransaction.Type.DISBURSEMENT: "#b91c1c",
+    InTransaction.Type.REVERSAL: "#2563eb",
+
+}
+
 
 @admin.register(InTransaction)
 class InTransactionAdmin(admin.ModelAdmin):
     list_display = (
-        "transaction_ref", "merchant_reference", "merchant", "msisdn", "network",
-        "amount_display", "gateway", "status_badge", "failure_reason",
-        "environment", "transaction_date",
+        "transaction_ref", "type_badge", "direction_badge", "merchant", "msisdn", "network",
+        "amount_display", "fee_display", "effect_display", "balance_after_display",
+        "status_badge", "environment", "transaction_date",
     )
     list_filter = (
-        "status", "environment", "gateway", "network",
+        "type", "status", "environment", "gateway", "network",
         "merchant", "failure_reason", "transaction_date",
     )
     search_fields = (
         "transaction_ref", "merchant_reference", "transaction_id",
         "external_reference", "msisdn", "merchant__name",
     )
-    list_select_related = ("merchant", "api_key")
+    list_select_related = ("merchant", "api_key", "related_transaction")
     date_hierarchy = "transaction_date"
     ordering = ("-transaction_date",)
     list_per_page = 50
@@ -323,11 +331,16 @@ class InTransactionAdmin(admin.ModelAdmin):
     fieldsets = (
         ("Summary", {"fields": (
             "id", "transaction_ref", "merchant_reference",
-            "status_badge", "failure_reason", "transaction_date",
+            "type_badge", "direction_badge", "status_badge", "failure_reason",
+            "transaction_date", "completed_at",
+        )}),
+        ("Money", {"fields": (
+            "amount", "currency", "platform_fee", "provider_fee", "margin_display",
+            "net_amount", "effect_display", "balance_after",
         )}),
         ("Merchant", {"fields": ("merchant", "api_key_link", "environment")}),
         ("Customer", {"fields": ("msisdn", "network", "channel", "narration")}),
-        ("Amounts", {"fields": ("amount", "currency", "fees", "net_amount")}),
+        ("Related", {"fields": ("related_link", "reversals_list")}),
         ("Provider", {"fields": (
             "gateway", "provider_status", "transaction_id",
             "external_reference", "provider_response_pretty",
@@ -337,7 +350,11 @@ class InTransactionAdmin(admin.ModelAdmin):
 
     def get_readonly_fields(self, request, obj=None):
         model_fields = [f.name for f in self.model._meta.fields]
-        return model_fields + ["status_badge", "api_key_link", "provider_response_pretty"]
+        return model_fields + [
+            "type_badge", "direction_badge", "status_badge", "effect_display",
+            "margin_display", "api_key_link", "related_link", "reversals_list",
+            "provider_response_pretty",
+        ]
 
     # Financial records: view only
     def has_add_permission(self, request):
@@ -349,6 +366,23 @@ class InTransactionAdmin(admin.ModelAdmin):
     def has_delete_permission(self, request, obj=None):
         return False
 
+    # ── Display helpers ──
+
+    @staticmethod
+    def _tzs(value):
+        return "—" if value is None else f"{value:,.0f}"
+
+    @admin.display(description="Type", ordering="type")
+    def type_badge(self, obj):
+        color = TXN_TYPE_COLORS.get(obj.type, "#6b7280")
+        return format_html('<b style="color:{}">{}</b>', color, obj.get_type_display())
+
+    @admin.display(description="Dir")
+    def direction_badge(self, obj):
+        if obj.direction == "credit":
+            return format_html('<b style="color:#15803d">▲ CR</b>')
+        return format_html('<b style="color:#b91c1c">▼ DR</b>')
+
     @admin.display(description="Status", ordering="status")
     def status_badge(self, obj):
         color = TXN_STATUS_COLORS.get(obj.status, "#6b7280")
@@ -357,6 +391,33 @@ class InTransactionAdmin(admin.ModelAdmin):
     @admin.display(description="Amount", ordering="amount")
     def amount_display(self, obj):
         return f"{obj.currency} {obj.amount:,.0f}"
+
+    @admin.display(description="Fee", ordering="platform_fee")
+    def fee_display(self, obj):
+        return self._tzs(obj.platform_fee)
+
+    @admin.display(description="Balance effect")
+    def effect_display(self, obj):
+        # Only completed collections and reversals, or started disbursements, moved the balance
+        if obj.balance_after is None:
+            return "—"
+        effect = obj.balance_effect
+        color = "#15803d" if effect >= 0 else "#b91c1c"
+        return format_html('<b style="color:{}">{}</b>', color, f"{effect:+,.0f}")
+
+    @admin.display(description="Balance after", ordering="balance_after")
+    def balance_after_display(self, obj):
+        if obj.balance_after is None:
+            return "—"
+        return format_html("<b>{}</b>", f"{obj.balance_after:,.0f}")
+
+    @admin.display(description="Margin (fee − provider fee)")
+    def margin_display(self, obj):
+        if obj.platform_fee is None or obj.provider_fee is None:
+            return "—"
+        margin = obj.platform_fee - obj.provider_fee
+        color = "#15803d" if margin >= 0 else "#b91c1c"
+        return format_html('<b style="color:{}">{}</b>', color, f"{margin:,.0f}")
 
     @admin.display(description="API key")
     def api_key_link(self, obj):
@@ -368,6 +429,25 @@ class InTransactionAdmin(admin.ModelAdmin):
         )
         return format_html('<a href="{}">{} ({})</a>', url, obj.api_key.name, obj.api_key.prefix)
 
+    def _txn_url(self, txn):
+        return reverse(f"admin:{txn._meta.app_label}_intransaction_change", args=[txn.pk])
+
+    @admin.display(description="Reverses")
+    def related_link(self, obj):
+        if not obj.related_transaction:
+            return "—"
+        rel = obj.related_transaction
+        return format_html('<a href="{}">{}</a>', self._txn_url(rel), rel.transaction_ref)
+
+    @admin.display(description="Reversed by")
+    def reversals_list(self, obj):
+        items = list(obj.reversals.all())
+        if not items:
+            return "—"
+        return format_html(", ".join(
+            f'<a href="{self._txn_url(r)}">{r.transaction_ref}</a>' for r in items
+        ))
+
     @admin.display(description="Provider response")
     def provider_response_pretty(self, obj):
         return pretty_json(obj.provider_response)
@@ -375,100 +455,155 @@ class InTransactionAdmin(admin.ModelAdmin):
     @admin.action(description="Export selected to CSV")
     def export_csv(self, request, queryset):
         fields = [
-            "id", "transaction_ref", "merchant_reference", "merchant__name",
+            "id", "transaction_ref", "merchant_reference", "type", "merchant__name",
             "environment", "msisdn", "network", "channel", "gateway",
-            "amount", "currency", "fees", "net_amount",
+            "amount", "currency", "platform_fee", "provider_fee", "net_amount", "balance_after",
             "status", "failure_reason", "provider_status",
-            "transaction_id", "external_reference", "transaction_date", "narration",
+            "transaction_id", "external_reference", "related_transaction__transaction_ref",
+            "transaction_date", "completed_at", "narration",
         ]
         stamp = timezone.localtime().strftime("%Y%m%d-%H%M")
         response = HttpResponse(content_type="text/csv")
         response["Content-Disposition"] = f'attachment; filename="transactions-{stamp}.csv"'
         writer = csv.writer(response)
-        writer.writerow(fields)
-        for row in queryset.values_list(*fields).iterator():
-            writer.writerow(row)
+        writer.writerow(fields + ["direction", "balance_effect"])
+        for txn in queryset.select_related("merchant", "related_transaction").iterator():
+            row = []
+            for f in fields:
+                value = txn
+                for part in f.split("__"):
+                    value = getattr(value, part, None) if value is not None else None
+                row.append(value)
+            effect = txn.balance_effect if txn.balance_after is not None else ""
+            writer.writerow(row + [txn.direction, effect])
         return response
 
 
-# ───────────────────────── Idempotency records ─────────────────────────
 
-@admin.register(IdempotencyRecord)
-class IdempotencyRecordAdmin(admin.ModelAdmin):
-    list_display = (
-        "idempotency_key", "key_prefix", "merchant_name", "status_badge",
-        "response_status", "transaction_link", "created_at", "is_expired",
-    )
-    list_filter = ("status", "response_status", "created_at")
-    search_fields = (
-        "idempotency_key", "api_key__prefix", "api_key__name",
-        "api_key__merchant__name", "transaction__transaction_ref",
-    )
-    list_select_related = ("api_key", "api_key__merchant", "transaction")
-    date_hierarchy = "created_at"
-    ordering = ("-created_at",)
-    actions = ["clear_stuck_processing", "delete_expired"]
+def _fee_for(plan, amount: Decimal) -> Decimal:
+    """Same calculation as services/fees.py, for display only."""
+    fee = amount * plan.percent / Decimal("100") + plan.fixed
+    fee = max(fee, plan.minimum)
+    if plan.maximum is not None:
+        fee = min(fee, plan.maximum)
+    return fee.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
 
-    fields = (
-        "api_key", "idempotency_key", "status_badge", "request_hash",
-        "transaction_link", "response_status", "response_body_pretty",
-        "created_at", "updated_at", "expires_at",
-    )
-    readonly_fields = fields
 
-    def has_add_permission(self, request):
-        return False
+class FeePlanForm(forms.ModelForm):
+    class Meta:
+        model = FeePlan
+        fields = "__all__"
+        help_texts = {
+            "merchant": "Leave blank for the default plan that applies to all merchants.",
+            "network": "vodacom, tigo, airtel, halotel, or blank for all networks.",
+            "max_amount": "Leave blank for no upper limit.",
+            "percent": "1.50 means 1.5%.",
+            "fixed": "Flat TZS added to the percentage.",
+        }
 
-    def has_change_permission(self, request, obj=None):
-        return False
+    def clean(self):
+        data = super().clean()
+        lo = data.get("min_amount") or Decimal("0")
+        hi = data.get("max_amount")
 
-    @admin.display(description="API key", ordering="api_key__prefix")
-    def key_prefix(self, obj):
-        return obj.api_key.prefix
+        if hi is not None and hi < lo:
+            raise ValidationError({"max_amount": "Max amount must be greater than min amount."})
 
-    @admin.display(description="Merchant", ordering="api_key__merchant__name")
-    def merchant_name(self, obj):
-        return obj.api_key.merchant or "—"
+        if data.get("maximum") is not None and data["maximum"] < (data.get("minimum") or 0):
+            raise ValidationError({"maximum": "Maximum fee must be greater than minimum fee."})
 
-    @admin.display(description="Status", ordering="status")
-    def status_badge(self, obj):
-        color = IDEM_STATUS_COLORS.get(obj.status, "#6b7280")
-        return format_html('<b style="color:{}">{}</b>', color, obj.get_status_display())
+        if not data.get("is_active"):
+            return data
 
-    @admin.display(description="Transaction")
-    def transaction_link(self, obj):
-        if not obj.transaction_id:
-            return "—"
-        url = reverse(
-            f"admin:{obj._meta.app_label}_intransaction_change",
-            args=[obj.transaction_id],
+        # Find active plans for the same merchant, type and network whose band overlaps this one
+        others = FeePlan.objects.filter(
+            merchant=data.get("merchant"),
+            transaction_type=data.get("transaction_type"),
+            network=data.get("network") or "",
+            is_active=True,
         )
-        return format_html('<a href="{}">{}</a>', url, obj.transaction.transaction_ref)
+        if self.instance.pk:
+            others = others.exclude(pk=self.instance.pk)
 
-    @admin.display(description="Expired", boolean=True)
-    def is_expired(self, obj):
-        return obj.expires_at <= timezone.now()
+        # Overlap: other.min <= this.max  AND  this.min <= other.max (blank max = no limit)
+        if hi is not None:
+            others = others.filter(min_amount__lte=hi)
+        others = others.filter(Q(max_amount__isnull=True) | Q(max_amount__gte=lo))
 
-    @admin.display(description="Response body")
-    def response_body_pretty(self, obj):
-        return pretty_json(obj.response_body)
-
-    @admin.action(description="Clear stuck 'processing' records (older than 2 min)")
-    def clear_stuck_processing(self, request, queryset):
-        cutoff = timezone.now() - timezone.timedelta(minutes=2)
-        count, _ = queryset.filter(
-            status=IdempotencyRecord.Status.PROCESSING, created_at__lt=cutoff,
-        ).delete()
-        self.message_user(request, f"Cleared {count} stuck record(s).", messages.SUCCESS)
-
-    @admin.action(description="Delete expired records")
-    def delete_expired(self, request, queryset):
-        count, _ = queryset.filter(expires_at__lte=timezone.now()).delete()
-        self.message_user(request, f"Deleted {count} expired record(s).", messages.SUCCESS)        
-
+        clash = others.first()
+        if clash:
+            raise ValidationError(f"This band overlaps an existing active plan: {clash}")
+        return data
 
 
 @admin.register(FeePlan)
 class FeePlanAdmin(admin.ModelAdmin):
-    list_display = ("merchant", "network", "percent", "fixed", "minimum", "maximum", "is_active")
-    list_filter = ("is_active", "network")        
+    form = FeePlanForm
+
+    list_display = (
+        "who", "transaction_type", "network_display", "band",
+        "percent", "fixed", "minimum", "maximum", "example_fee", "is_active",
+    )
+    list_filter = ("transaction_type", "is_active", "network", "merchant")
+    search_fields = ("merchant__name",)
+    list_select_related = ("merchant",)
+    list_editable = ("is_active",)
+    ordering = ("merchant", "transaction_type", "network", "min_amount")
+    actions = ["activate", "deactivate"]
+
+    fieldsets = (
+        ("Applies to", {"fields": ("merchant", "transaction_type", "network")}),
+        ("Amount band", {"fields": ("min_amount", "max_amount")}),
+        ("Fee", {"fields": ("percent", "fixed", "minimum", "maximum")}),
+        ("Status", {"fields": ("is_active", "examples")}),
+    )
+    readonly_fields = ("examples",)
+
+    # Keep history: switch plans off instead of deleting them
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    @admin.display(description="Merchant", ordering="merchant__name")
+    def who(self, obj):
+        return obj.merchant or "Default (all merchants)"
+
+    @admin.display(description="Network", ordering="network")
+    def network_display(self, obj):
+        return obj.network or "All"
+
+    @admin.display(description="Band (TZS)", ordering="min_amount")
+    def band(self, obj):
+        top = f"{obj.max_amount:,.0f}" if obj.max_amount is not None else "∞"
+        return f"{obj.min_amount:,.0f} – {top}"
+
+    @admin.display(description="Example")
+    def example_fee(self, obj):
+        # Fee at the bottom of the band (or 10,000 for open bands starting at 0)
+        amount = obj.min_amount if obj.min_amount > 0 else Decimal("10000")
+        if obj.max_amount is not None and amount > obj.max_amount:
+            amount = obj.max_amount
+        return f"{amount:,.0f} → fee {_fee_for(obj, amount):,.0f}"
+
+    @admin.display(description="Example fees")
+    def examples(self, obj):
+        if not obj or not obj.pk:
+            return "Save to see examples."
+        lo = obj.min_amount
+        hi = obj.max_amount if obj.max_amount is not None else lo + Decimal("100000")
+        samples = sorted({lo, (lo + hi) / 2, hi})
+        rows = [f"{a:,.0f} → fee {_fee_for(obj, a):,.0f}" for a in samples if a > 0]
+        return "\n".join(rows) or "—"
+
+    @admin.action(description="Activate selected plans")
+    def activate(self, request, queryset):
+        count = queryset.update(is_active=True)
+        self.message_user(
+            request,
+            f"Activated {count} plan(s). Check that no active bands overlap.",
+            messages.WARNING,
+        )
+
+    @admin.action(description="Deactivate selected plans")
+    def deactivate(self, request, queryset):
+        count = queryset.update(is_active=False)
+        self.message_user(request, f"Deactivated {count} plan(s).", messages.SUCCESS)    
