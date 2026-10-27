@@ -1,0 +1,158 @@
+# GitLab CI: build, smoke-test and publish the Kizuna development image.
+#
+# The image is pushed to the project's GitLab Container Registry:
+#   $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+#   $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+#   $CI_REGISTRY_IMAGE:latest            (default branch and tags)
+#   $CI_REGISTRY_IMAGE:<sanitised tag>   (tag pipelines)
+#
+# Merge request pipelines build and smoke-test the image but do not push it.
+#
+# Requirements:
+#   * GitLab Container Registry enabled for the project.
+#   * A runner that can run Docker-in-Docker (the dind service needs a
+#     privileged runner). If your runners cannot use privileged containers,
+#     replace the docker:dind service with Kaniko or buildah.
+#
+# No secrets are stored in this file. The smoke test uses throwaway values
+# only; they are never used outside `manage.py check`.
+
+stages:
+  - build
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    - if: '$CI_COMMIT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+
+variables:
+  DOCKER_BUILDKIT: "1"
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  DOCKER_HOST: "tcp://docker:2376"
+  DOCKER_TLS_VERIFY: "1"
+  DOCKER_CERT_PATH: "/certs/client"
+  IMAGE: "$CI_REGISTRY_IMAGE"
+
+default:
+  image: docker:27-cli
+  services:
+    - name: docker:27-dind
+      alias: docker
+
+  before_script:
+    - |
+      set -eu
+      # Wait for the dind service to accept connections.
+      i=0
+      while [ "$i" -lt 30 ]; do
+        if docker info >/dev/null 2>&1; then
+          break
+        fi
+        i=$((i + 1))
+        sleep 1
+      done
+      docker info >/dev/null
+
+      # MR pipelines do not push, so they do not need registry credentials.
+      # (This also keeps forked-MR pipelines working without write access.)
+      if [ "${CI_PIPELINE_SOURCE:-}" != "merge_request_event" ] \
+         && [ -n "${CI_REGISTRY_PASSWORD:-}" ]; then
+        printf '%s' "$CI_REGISTRY_PASSWORD" \
+          | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+      fi
+
+  after_script:
+    - docker logout "$CI_REGISTRY" >/dev/null 2>&1 || true
+
+build-image:
+  stage: build
+  timeout: 30m
+  interruptible: true
+
+  # If shared runners and a privileged runner are both available, add a tag
+  # here matching only the privileged runner so this job cannot land on a
+  # runner that cannot start docker:dind:
+  # tags:
+  #   - docker
+
+  script:
+    - |
+      set -eu
+      BUILD_TAG="$CI_COMMIT_SHORT_SHA"
+      REF_TAG="$CI_COMMIT_REF_SLUG"
+
+      # Best-effort cache warm-up; absence of the cache image must not fail.
+      docker pull "$IMAGE:latest" >/dev/null 2>&1 || true
+
+      docker build \
+        --pull \
+        --progress=plain \
+        --build-arg BUILDKIT_INLINE_CACHE=1 \
+        --cache-from "$IMAGE:latest" \
+        --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" \
+        --label "org.opencontainers.image.source=$CI_PROJECT_URL" \
+        --label "org.opencontainers.image.title=kizuna" \
+        -t "$IMAGE:$BUILD_TAG" \
+        -t "$IMAGE:$REF_TAG" \
+        .
+
+      # Fail the pipeline before publishing if Django cannot even load the
+      # project. Dummy values are required because settings are env-driven;
+      # this is a configuration check, not a database/network test.
+      docker run --rm \
+        -e SECRET_KEY="ci-smoke-only-secret-key-0123456789-abcdefghijklmnopqrstuvwxyz" \
+        -e DEBUG="False" \
+        -e ALLOWED_HOSTS="localhost,127.0.0.1" \
+        -e DB_NAME="kizuna" \
+        -e DB_USER="kizuna" \
+        -e DB_PASSWORD="kizuna" \
+        -e DB_HOST="127.0.0.1" \
+        -e DB_PORT="5432" \
+        -e SIGNING_KEY="ci-smoke-only-signing-key" \
+        -e TEMBO_ACCOUNT_ID="ci" \
+        -e TEMBO_SECRET_KEY="ci" \
+        -e TEMBO_COLLECTION_URL="https://example.invalid/collection" \
+        -e TEMBO_COLLECTION_STATUS_URL="https://example.invalid/status" \
+        -e TEMBO_CALLBACK_URL="https://example.invalid/callback" \
+        -e TEMBO_CALLBACK_TOKEN="ci-smoke-only-callback-token" \
+        -e TEMBO_VERIFY_CALLBACKS="False" \
+        -e SNIPPE_API_KEY="ci" \
+        -e SNIPPE_BASE_URL="https://example.invalid" \
+        -e SNIPPE_WEBHOOK_URL="https://example.invalid/webhook" \
+        "$IMAGE:$BUILD_TAG" \
+        python manage.py check --fail-level ERROR
+
+    - |
+      set -eu
+      if [ "${CI_PIPELINE_SOURCE:-}" = "merge_request_event" ]; then
+        echo "Merge request pipeline: image built and smoke-tested, not pushed."
+        exit 0
+      fi
+
+      echo "Pushing $IMAGE:$CI_COMMIT_SHORT_SHA"
+      docker push "$IMAGE:$CI_COMMIT_SHORT_SHA"
+
+      # Avoid a branch literally named "latest" overwriting the stable tag.
+      if [ "$CI_COMMIT_REF_SLUG" != "latest" ]; then
+        docker push "$IMAGE:$CI_COMMIT_REF_SLUG"
+      fi
+
+      RELEASE_TAG=""
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        RELEASE_TAG=$(printf '%s' "$CI_COMMIT_TAG" | sed 's/[^A-Za-z0-9_.-]/-/g')
+      fi
+
+      if [ "${CI_COMMIT_BRANCH:-}" = "$CI_DEFAULT_BRANCH" ] \
+         || [ -n "${CI_COMMIT_TAG:-}" ]; then
+        docker tag "$IMAGE:$CI_COMMIT_SHORT_SHA" "$IMAGE:latest"
+        docker push "$IMAGE:latest"
+      fi
+
+      if [ -n "$RELEASE_TAG" ]; then
+        docker tag "$IMAGE:$CI_COMMIT_SHORT_SHA" "$IMAGE:$RELEASE_TAG"
+        docker push "$IMAGE:$RELEASE_TAG"
+      fi
